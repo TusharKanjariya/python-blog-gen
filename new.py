@@ -179,21 +179,18 @@ def build_messages(video_title, channel, video_url, transcript_text, transcript_
     today = datetime.date.today().isoformat()
     system = (
         "You are a skilled writer creating engaging Medium articles.\n"
-        "- Blog title must be curiosity-driven, scroll-stopping, and irresistible.\n"
         "- Write in a human, authoritative voice with short, easy-to-read paragraphs.\n"
-        "- Always use very simple words, but keep the tone professional.\n"
-        "- Add real-world examples to illustrate points.\n"
-        "- If topic relates to programming, include clear code blocks or step-by-step tutorials.\n"
-        "- Structure: Start with a TL;DR summary → main content with subheadings → examples/tutorials → concise conclusion.\n"
-        "- At the end, suggest **Top 5 Medium tags** that will improve reach.\n"
-        "- Return content in Markdown format suitable for Medium (no YAML front matter).\n"
-        "- Give Curios Title, Subtitle, And Kicker.\n"
-        "- Add Conclusion or any relevant section at the very end of the blog.\n"
-        "- Minimum length: 1500 characters.\n"
-        "- Don't generate fake quotes, sources, or references.\n"
-        "- don't generate any section like TL;DR like all robotic style blogs only human written tone like section is applicable .\n"
-        "- I am writing on Medium so please follow the Medium writing style.\n"
+        "- Use simple words, professional tone.\n"
+        "- Add real-world examples where possible.\n"
+        "- If programming-related, include code blocks or step-by-step tutorials.\n"
+        "- Structure with clear subheadings; finish with a concise Conclusion.\n"
+        "- END WITH a **Key Takeaways** section of 3–5 bullets.\n"
+        "- Suggest **Top 5 Medium tags** at the very end.\n"
+        "- Return Markdown (no YAML). Include a curiosity Title, short Subtitle, and a Kicker.\n"
+        "- Minimum length: ~1500 characters.\n"
+        "- Do not invent sources or quotes.\n"
     )
+    transcript_snippet = transcript_text[:120000]
     user = f"""
 VIDEO TITLE: {video_title}
 CHANNEL: {channel}
@@ -202,9 +199,89 @@ DATE: {today}
 TRANSCRIPT SOURCE: {transcript_source}
 
 TRANSCRIPT:
-{transcript_text[:200000]}
+{transcript_snippet}
 """
     return [{"role":"system","content":system},{"role":"user","content":user}]
+
+
+def split_into_chunks(text: str, target_chars: int = 12000, overlap: int = 500):
+    """
+    Greedy, whitespace-aware splitter.
+    - target_chars: ~size of each chunk (characters, not tokens).
+    - overlap: small overlap so context flows across chunks.
+    Returns list[str].
+    """
+    text = text.strip()
+    if len(text) <= target_chars:
+        return [text]
+
+    chunks, i, n = [], 0, len(text)
+    while i < n:
+        end = min(i + target_chars, n)
+        # try to break at whitespace near the end
+        if end < n:
+            j = text.rfind(" ", i + int(0.8*target_chars), end)
+            if j != -1:
+                end = j
+        chunk = text[i:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        i = max(end - overlap, i + 1)
+    return chunks
+
+
+def summarize_chunk_with_llm(chunk_text: str, model=MODEL):
+    """
+    Summarize a single chunk into a concise, structured outline paragraph.
+    Keep names, numbers, and key steps.
+    """
+    messages = [
+        {"role": "system", "content": (
+            "You summarize transcripts into concise notes. "
+            "Keep only the essentials: key points, steps, numbers, names, and definitions. "
+            "Prefer bullet-y prose (short lines). Avoid fluff."
+        )},
+        {"role": "user", "content": f"Summarize this transcript chunk:\n\n{chunk_text}"}
+    ]
+    return openrouter_chat(messages, model=model, temperature=0.2, max_tokens=600)
+
+
+def compose_article_from_summaries(video_title: str, channel: str, video_url: str,
+                                   chunk_summaries: list[str], model=MODEL, max_tokens=1800):
+    """
+    Turn chunk-level summaries into one cohesive Medium-style article.
+    Enforce a 'Key Takeaways' section at the end.
+    """
+    joined = "\n\n---\n\n".join(chunk_summaries)
+    today = datetime.date.today().isoformat()
+
+    system = (
+        "You are a skilled writer creating engaging Medium articles.\n"
+        "- Write in a human, authoritative voice with short paragraphs.\n"
+        "- Use simple words, professional tone; add real examples where possible.\n"
+        "- Organize with clear subheadings; keep flow logical.\n"
+        "- If relevant to programming, include code blocks or step-by-step guidance.\n"
+        "- Return Markdown (no YAML). Include Title, Subtitle, and a short Kicker at top.\n"
+        "- END WITH a **Key Takeaways** section of 3–5 bullets—no exceptions.\n"
+        "- Add a concise Conclusion before Key Takeaways.\n"
+        "- Suggest **Top 5 Medium tags** at the very end.\n"
+        "- Minimum length: ~1500 characters.\n"
+        "- Do not invent sources or quotes."
+    )
+
+    user = (
+        f"VIDEO TITLE: {video_title}\n"
+        f"CHANNEL: {channel}\n"
+        f"VIDEO URL: {video_url}\n"
+        f"DATE: {today}\n\n"
+        "Below are structured summaries of the full transcript, in order. "
+        "Write ONE cohesive article covering all the important points. "
+        "Preserve technical accuracy and any numbers/steps mentioned.\n\n"
+        f"{joined}"
+    )
+
+    messages = [{"role":"system","content":system},{"role":"user","content":user}]
+    return openrouter_chat(messages, model=model, temperature=0.3, max_tokens=max_tokens)
 
 # --------- Main flow ---------
 def youtube_to_md(url: str, outdir="output", asr_model="small", device="auto"):
@@ -226,6 +303,36 @@ def youtube_to_md(url: str, outdir="output", asr_model="small", device="auto"):
             transcript, source = local_whisper_transcribe(url, model_size=asr_model, device=device, ffmpeg_location=args.ffmpeg_location)
         except Exception as e:
             raise RuntimeError(f"Local transcription failed: {e}")
+        
+        # After obtaining `transcript` and before generating Markdown:
+    # Decide: single-pass vs chunked 2-pass
+    CHUNK_THRESHOLD = 20000   # characters; adjust for your model/costs
+    USE_CHUNKING = len(transcript) > CHUNK_THRESHOLD
+
+    if USE_CHUNKING:
+        print(f"Transcript is long ({len(transcript):,} chars). Using 2-pass chunking...")
+        chunks = split_into_chunks(transcript, target_chars=12000, overlap=500)
+
+        # 1) Summarize each chunk
+        chunk_summaries = []
+        for idx, ch in enumerate(chunks, 1):
+            print(f"Summarizing chunk {idx}/{len(chunks)} (~{len(ch):,} chars)")
+            summary = summarize_chunk_with_llm(ch, model=MODEL)
+            chunk_summaries.append(f"Chunk {idx} summary:\n{summary}")
+
+        # 2) Compose final article from all summaries
+        blog_md = compose_article_from_summaries(
+            video_title=title,
+            channel=author,
+            video_url=url,
+            chunk_summaries=chunk_summaries,
+            model=MODEL,
+            max_tokens=1800  # you can raise if you want longer output
+        )
+    else:
+        # Short enough → single pass (still ends with Key Takeaways via build_messages)
+        messages = build_messages(title, author, url, transcript, source)
+        blog_md = openrouter_chat(messages, model=MODEL, max_tokens=1600)
 
     # 3) Generate Markdown grounded in transcript
     messages = build_messages(title, author, url, transcript, source)
